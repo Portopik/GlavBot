@@ -570,3 +570,256 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Удаляем старые записи
         flood_cache[cache_key] = [
+            t for t in flood_cache[cache_key] 
+            if current_time - t <= settings.get('antiflood_seconds', 10)
+        ]
+        
+        # Проверяем количество сообщений за период
+        if len(flood_cache[cache_key]) > settings.get('antiflood_count', 5):
+            # Флуд! Заглушаем на 5 минут
+            try:
+                await message.delete()
+                
+                mute_until = datetime.now() + timedelta(minutes=5)
+                await chat.restrict_member(
+                    user.id,
+                    permissions=ChatPermissions(can_send_messages=False),
+                    until_date=mute_until
+                )
+                
+                db.add_mute(chat.id, user.id, 300)  # 5 минут
+                
+                await context.bot.send_message(
+                    chat.id,
+                    f"🚫 {user.full_name} заглушен на 5 минут за флуд."
+                )
+            except:
+                pass
+            return
+    
+    # АНТИ-МАТ
+    bad_words = db.get_bad_words(chat.id)
+    if bad_words:
+        text_lower = message.text.lower()
+        for word in bad_words:
+            if word.lower() in text_lower:
+                try:
+                    await message.delete()
+                    
+                    # Выдаем предупреждение
+                    warn_count = db.add_warning(chat.id, user.id, context.bot.id, f"Мат: {word}")
+                    
+                    await context.bot.send_message(
+                        chat.id,
+                        f"⚠️ {user.full_name}, использование запрещенных слов запрещено!\n"
+                        f"Предупреждение {warn_count}/{settings.get('warn_limit', 3)}"
+                    )
+                    
+                    # Проверяем лимит предупреждений
+                    if warn_count >= settings.get('warn_limit', 3):
+                        await chat.ban_member(user.id)
+                        await context.bot.send_message(
+                            chat.id,
+                            f"🚫 {user.full_name} забанен за превышение лимита предупреждений."
+                        )
+                except:
+                    pass
+                return
+
+# === ОБРАБОТЧИКИ КНОПОК ===
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатий на кнопки"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    user = query.from_user
+    chat = query.message.chat
+    
+    if data == "accept_rules":
+        await query.edit_message_text("✅ Спасибо! Правила приняты.")
+        
+        # Если пользователь был ограничен, снимаем ограничения
+        if db.is_muted(chat.id, user.id):
+            db.remove_mute(chat.id, user.id)
+            await chat.restrict_member(
+                user.id,
+                permissions=ChatPermissions(can_send_messages=True)
+            )
+    
+    elif data == "solve_captcha":
+        if 'captcha' in context.user_data:
+            captcha = context.user_data['captcha']
+            if captcha['user_id'] == user.id and captcha['chat_id'] == chat.id:
+                await query.edit_message_text(
+                    "✅ Капча решена! Напишите ответ в чат."
+                )
+            else:
+                await query.edit_message_text("❌ Это не ваша капча!")
+        else:
+            await query.edit_message_text("❌ Капча не найдена!")
+    
+    elif data == "menu_rules":
+        settings = db.get_chat_settings(chat.id)
+        keyboard = [[InlineKeyboardButton("✅ Принять", callback_data="accept_rules")]]
+        await query.edit_message_text(
+            settings.get('rules', "Правила не установлены."),
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif data == "menu_info":
+        stats = db.get_user_stats(chat.id, user.id)
+        warns = db.get_warnings_count(chat.id, user.id)
+        
+        text = f"**Ваша информация:**\n\nID: `{user.id}`\n"
+        text += f"Предупреждений: {warns}\n"
+        
+        if stats:
+            text += f"Сообщений: {stats['messages_count']}\n"
+        
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+    
+    elif data == "menu_help":
+        await query.edit_message_text(
+            "Используйте /help для списка команд.\n"
+            "Или просто пишите в чат!",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data == "menu_report":
+        await query.edit_message_text(
+            "Чтобы пожаловаться, ответьте /report на сообщение."
+        )
+
+# === НАСТРОЙКИ (АДМИН-ПАНЕЛЬ) ===
+
+async def set_welcome_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Установить приветствие (/set_welcome Текст)"""
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ Только для админов!")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("❌ Укажите текст приветствия!")
+        return
+    
+    welcome_text = ' '.join(context.args)
+    chat_id = update.effective_chat.id
+    
+    db.update_welcome(chat_id, welcome_text)
+    await update.message.reply_text("✅ Приветствие обновлено!")
+
+async def set_rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Установить правила (/set_rules Текст)"""
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ Только для админов!")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("❌ Укажите текст правил!")
+        return
+    
+    rules_text = ' '.join(context.args)
+    chat_id = update.effective_chat.id
+    
+    db.update_rules(chat_id, rules_text)
+    await update.message.reply_text("✅ Правила обновлены!")
+
+async def add_badword_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавить плохое слово (/add_badword слово)"""
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ Только для админов!")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("❌ Укажите слово!")
+        return
+    
+    word = context.args[0].lower()
+    chat_id = update.effective_chat.id
+    
+    bad_words = db.get_bad_words(chat_id)
+    if word not in bad_words:
+        bad_words.append(word)
+        db.update_bad_words(chat_id, bad_words)
+        await update.message.reply_text(f"✅ Слово '{word}' добавлено в черный список!")
+    else:
+        await update.message.reply_text(f"⚠️ Слово '{word}' уже в списке!")
+
+async def remove_badword_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удалить плохое слово (/remove_badword слово)"""
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ Только для админов!")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("❌ Укажите слово!")
+        return
+    
+    word = context.args[0].lower()
+    chat_id = update.effective_chat.id
+    
+    bad_words = db.get_bad_words(chat_id)
+    if word in bad_words:
+        bad_words.remove(word)
+        db.update_bad_words(chat_id, bad_words)
+        await update.message.reply_text(f"✅ Слово '{word}' удалено из черного списка!")
+    else:
+        await update.message.reply_text(f"⚠️ Слово '{word}' не найдено в списке!")
+
+# === ОСНОВНАЯ ФУНКЦИЯ ===
+
+def main():
+    """Запуск бота"""
+    # Создаем приложение
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Команды модерации
+    application.add_handler(CommandHandler("ban", ban_command))
+    application.add_handler(CommandHandler("unban", unban_command))
+    application.add_handler(CommandHandler("mute", mute_command))
+    application.add_handler(CommandHandler("unmute", unmute_command))
+    application.add_handler(CommandHandler("warn", warn_command))
+    application.add_handler(CommandHandler("unwarn", unwarn_command))
+    application.add_handler(CommandHandler("clear", clear_command))
+    application.add_handler(CommandHandler("pin", pin_command))
+    application.add_handler(CommandHandler("slowmode", slowmode_command))
+    
+    # Пользовательские команды
+    application.add_handler(CommandHandler("report", report_command))
+    application.add_handler(CommandHandler("info", info_command))
+    application.add_handler(CommandHandler("rules", rules_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("start", menu_command))
+    
+    # Команды настройки
+    application.add_handler(CommandHandler("set_welcome", set_welcome_command))
+    application.add_handler(CommandHandler("set_rules", set_rules_command))
+    application.add_handler(CommandHandler("add_badword", add_badword_command))
+    application.add_handler(CommandHandler("remove_badword", remove_badword_command))
+    
+    # Обработчики событий
+    application.add_handler(MessageHandler(
+        filters.StatusUpdate.NEW_CHAT_MEMBERS, 
+        handle_new_members
+    ))
+    application.add_handler(MessageHandler(
+        filters.StatusUpdate.LEFT_CHAT_MEMBER,
+        handle_left_member
+    ))
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_messages
+    ))
+    
+    # Обработчик кнопок
+    application.add_handler(CallbackQueryHandler(button_callback))
+    
+    # Запускаем бота
+    print("🤖 Бот запущен! Нажмите Ctrl+C для остановки.")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
