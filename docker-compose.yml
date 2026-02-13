@@ -1,0 +1,10 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+    volumes:
+      - ./bot_database.db:/app/bot_database.db
+    restart: always
